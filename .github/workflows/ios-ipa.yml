@@ -1,0 +1,380 @@
+# Cross-compiles Blender for iOS (arm64) and packages it as an *unsigned* .ipa.
+#
+# The .ipa is NOT code-signed: it cannot be installed directly on a device, but
+# it can be re-signed afterwards (AltStore, Sideloadly, TrollStore, a manual
+# `codesign` pass with your own profile, ...) or inspected as a build artifact.
+#
+# NOTE: by default this builds the `ios-ipad-5.0` branch (the `ref` input), not the
+# `ios-ipad` tip. The tip was merged up to Blender 5.3 (which requires Python 3.13),
+# but the iOS precompiled libraries (lib/ios_arm64) still ship Python 3.11, so the
+# tip does not build. `ios-ipad-5.0` is Blender 5.0 (matching the 3.11 iOS libraries)
+# plus the iOS app fixes (interface scale, native iPad resolution, launch screen).
+# Once lib/ios_arm64 is regenerated for Python 3.13, set the `ref` input to `ios-ipad`
+# to build the tip. See release/ios/UPDATING_VERSION.md.
+#
+# How the build works (see release/ios/README.md and the GNUmakefile):
+#   * `make all ios`
+#       - `all` : the real configure + build + install target.
+#       - `ios` : flips the cross-compile switches (WITH_APPLE_CROSSPLATFORM,
+#                 APPLE_TARGET_DEVICE=ios). On its own `make ios` only echoes.
+#   * BUILD_DIR is intentionally left at its default (../build_ios), because the
+#     host-tools sub-build path is hard-coded to ../build_ios/build_darwin_tools.
+#   * CMAKE_SYSTEM_NAME=iOS is passed on the command line. CMake only enters
+#     cross-compile mode if it is set *before* project() runs; the repo writes it
+#     to the cache too late (CMakeLists.txt:112, after project()), so a clean
+#     configure otherwise aborts at the guard on CMakeLists.txt:123.
+#   * Precompiled dependencies are pulled from the Git-LFS submodules
+#     lib/macos_arm64 (host tools + host Python) and lib/ios_arm64 (target libs)
+#     instead of building them from source with `make deps ios` (hours long).
+#   * PYTHON_VERSION is detected from the libraries at runtime. The source enforces
+#     a hard minimum (e.g. >= 3.13); if lib/ios_arm64 ships an older Python the job
+#     fails fast with an actionable message (the iOS libs must be regenerated for
+#     this source version — no command-line workaround exists). See the
+#     "Resolve and validate the Python version" step.
+
+name: Build iOS IPA (unsigned)
+
+on:
+  # Manual run from the Actions tab.
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: >-
+          Commit/branch/tag to build. Defaults to `ios-ipad-5.0`: Blender 5.0 plus the
+          iOS app fixes (interface scale, native iPad resolution, launch screen), built
+          against the current Python 3.11 iOS libraries. Once lib/ios_arm64 is regenerated
+          for Python 3.13, set this to `ios-ipad` to build the 5.3 tip. See
+          release/ios/UPDATING_VERSION.md.
+        default: ios-ipad-5.0
+        required: false
+  # Push a tag like `ipa-2026-06-13` to cut an unsigned build.
+  push:
+    tags:
+      - "ipa-*"
+
+# A full Blender build is expensive; don't run two for the same ref at once.
+concurrency:
+  group: ios-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build-ipa:
+    name: Cross-compile Blender for iOS (arm64)
+    # Apple Silicon image (matches lib/*_arm64); ships Xcode 16+, git-lfs, cmake.
+    runs-on: macos-15
+    # GitHub-hosted hard limit. A cold build can take a couple of hours.
+    timeout-minutes: 360
+    env:
+      HOMEBREW_NO_AUTO_UPDATE: "1"
+      HOMEBREW_NO_INSTALL_CLEANUP: "1"
+
+    steps:
+      - name: Checkout source (with Git LFS data files)
+        uses: actions/checkout@v6
+        with:
+          # Build the revision whose Python/deps match the current iOS libraries.
+          # See the `ref` input above and release/ios/UPDATING_VERSION.md.
+          ref: ${{ github.event.inputs.ref || 'ios-ipad-5.0' }}
+          lfs: true
+          # lib/* are huge `update = none` submodules; fetched explicitly below.
+          submodules: false
+
+      - name: Show toolchain versions
+        run: |
+          set -eux
+          sw_vers
+          xcodebuild -version
+          cmake --version
+          git --version
+          git lfs version
+          df -h /
+
+      - name: Install ccache (speeds up re-runs)
+        run: brew install ccache
+
+      - name: Fetch precompiled libraries (host macOS + target iOS)
+        run: |
+          set -eux
+          git lfs install --skip-repo
+          # Mirrors build_files/utils/make_update.py (--use-ios-libraries) but
+          # without touching the checked-out source revision.
+          for sub in lib/macos_arm64 lib/ios_arm64; do
+            git config --local "submodule.$sub.update" checkout
+            GIT_LFS_SKIP_SMUDGE=1 git submodule update --init --progress "$sub"
+            git -C "$sub" lfs pull
+          done
+          test -d lib/ios_arm64/python   || { echo "::error::iOS libraries missing (lib/ios_arm64)";   exit 1; }
+          test -d lib/macos_arm64/python || { echo "::error::host libraries missing (lib/macos_arm64)"; exit 1; }
+
+      - name: Reclaim disk space from the LFS object cache
+        # The smudged files already live in the working tree; the duplicate copy
+        # in the submodule's .git/lfs store is dead weight on the small runner.
+        run: |
+          set -eux
+          rm -rf .git/modules/lib/macos_arm64/lfs .git/modules/lib/ios_arm64/lfs || true
+          df -h /
+
+      - name: Resolve and validate the Python version
+        id: py
+        # PYTHON_VERSION drives BOTH the cross-compile host interpreter lookup
+        # (lib/macos_arm64/python/bin/python<ver>) and the iOS target find_package
+        # (lib/ios_arm64). It must equal the version the iOS target libs ship, since
+        # that Python is linked into the app. The source also enforces a hard minimum
+        # (CMakeLists.txt: "At least Python X is required"). If lib/ios_arm64 lags the
+        # source and ships an older Python, no command-line trick can fix it — the
+        # iOS libraries must be regenerated for this source version. Fail fast with an
+        # actionable message rather than dying deep in the configure.
+        run: |
+          set -eux
+          detect() { ls "$1"/python3.* 2>/dev/null | grep -E 'python3\.[0-9]+$' \
+                       | sed -E 's#.*/python##' | sort -V | tail -1; }
+          host_py=$(detect lib/macos_arm64/python/bin)
+          tgt_py=$(detect lib/ios_arm64/python/bin)
+          test -n "$host_py"; test -n "$tgt_py"
+          # Minimum Python the source requires (parsed from the hard-requirement
+          # message so it tracks future bumps; other VERSION_LESS "3.x" checks in
+          # CMakeLists.txt are unrelated, e.g. numpy include-path selection).
+          req=$(grep -oE 'At least Python 3\.[0-9]+ is required' CMakeLists.txt | grep -oE '3\.[0-9]+' | sort -V | tail -1)
+          : "${req:=3.13}"
+          echo "host(macOS)=$host_py  target(iOS)=$tgt_py  source requires >= $req"
+          lowest=$(printf '%s\n%s\n' "$req" "$tgt_py" | sort -V | head -1)
+          if [ "$tgt_py" != "$req" ] && [ "$lowest" = "$tgt_py" ]; then
+            echo "::error::lib/ios_arm64 ships Python $tgt_py but this Blender source requires >= $req. The iOS precompiled libraries are stale relative to the source. They must be regenerated for this version: run 'make deps ios' on a Mac (the *_ios.diff patches may need rebasing first) and update the lib/ios_arm64 submodule. See release/ios/BUILDING_ON_MACOS.md."
+            exit 1
+          fi
+          # Bridge the host interpreter only if it lacks the target version. It is used
+          # solely to run version-agnostic build scripts, so a name-only link is safe.
+          # No-op once the two library sets are consistent.
+          if [ "$host_py" != "$tgt_py" ] && [ ! -e "lib/macos_arm64/python/bin/python${tgt_py}" ]; then
+            echo "::warning::Bridging host interpreter python${tgt_py} -> python${host_py}."
+            ln -sf "python${host_py}" "lib/macos_arm64/python/bin/python${tgt_py}"
+          fi
+          echo "version=$tgt_py" >> "$GITHUB_OUTPUT"
+
+      - name: Cache ccache directory
+        uses: actions/cache@v5
+        with:
+          path: ~/.cache/ccache
+          key: ccache-ios-${{ github.sha }}
+          restore-keys: |
+            ccache-ios-
+
+      - name: Build Blender for iOS and install the .app bundle
+        env:
+          # - CMAKE_SYSTEM_NAME=iOS must be on the command line so CMake cross-compiles
+          #   from the very first project() call (the repo's in-tree cache write is too late).
+          # - PYTHON_VERSION avoids the platform_apple.cmake fallback that hard-codes
+          #   python3.11 for the cross-compile host on a fresh configure.
+          BUILD_CMAKE_ARGS: >-
+            -DCMAKE_SYSTEM_NAME=iOS
+            -DCMAKE_OSX_ARCHITECTURES=arm64
+            -DPYTHON_VERSION=${{ steps.py.outputs.version }}
+            -DWITH_COMPILER_CCACHE=ON
+            -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=BOTH
+            -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=BOTH
+            -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=BOTH
+        run: |
+          set -eux
+          export CCACHE_DIR="$HOME/.cache/ccache"
+          export CCACHE_MAXSIZE="5G"
+          BUILD_DIR="$(dirname "$GITHUB_WORKSPACE")/build_ios"
+
+          # Start from a clean build dir so CMAKE_SYSTEM_NAME=iOS is honoured on the
+          # first project() call (a leftover CMakeSystem.cmake would pin it to Darwin).
+          rm -rf "$BUILD_DIR"
+
+          # `ios` flips the cross-compile switches; `all` configures, builds and installs.
+          # ccache (cached above) makes recompiles cheap even though the build dir is fresh.
+          make all ios
+
+          ccache --show-stats || true
+          df -h /
+
+      - name: Package the unsigned .ipa
+        id: pkg
+        run: |
+          set -eux
+          BUILD_DIR="$(dirname "$GITHUB_WORKSPACE")/build_ios"
+          # The real cross-compiled iOS bundle is installed to $BUILD_DIR/bin/Blender.app
+          # (see GNUmakefile BLENDER_BIN). A near-empty *host-tools* stub is also produced
+          # under $BUILD_DIR/build_darwin_tools/.../bin/Blender.app while building makesdna,
+          # makesrna, etc. for the runner — that stub has no Assets/ and no real binary, and
+          # zipping it yields a ~1 KB, uninstallable .ipa. Prefer the canonical path and
+          # never pick anything under build_darwin_tools.
+          APP="$BUILD_DIR/bin/Blender.app"
+          if [ ! -d "$APP" ]; then
+            APP=$(find "$BUILD_DIR" -type d -name 'Blender.app' \
+                    -not -path '*/build_darwin_tools/*' | head -1)
+          fi
+          test -n "$APP" && test -d "$APP" || { echo "::error::iOS Blender.app not found under $BUILD_DIR (only a host-tools stub?)"; exit 1; }
+
+          # Sanity-check that we grabbed a populated bundle, not an empty stub: it must
+          # contain the Mach-O executable. (iOS bundles are flat: binary + Assets/ at the root.)
+          test -f "$APP/blender" || test -f "$APP/Blender" \
+            || { echo "::error::$APP has no executable — this looks like the host-tools stub, not the iOS app"; ls -laR "$APP" || true; exit 1; }
+          test -d "$APP/Assets" || echo "::warning::Assets/ not found inside bundle (runtime resources may be incomplete)"
+          echo "Packaging bundle: $APP"
+          du -sh "$APP" || true
+
+          stage="$RUNNER_TEMP/ipa"
+          rm -rf "$stage"
+          mkdir -p "$stage/Payload"
+          cp -R "$APP" "$stage/Payload/"
+          staged_app="$stage/Payload/$(basename "$APP")"
+
+          # Strip non-runtime Python build artifacts from the staged bundle.
+          # The bundled CPython ships its build configuration (lib/pythonX.Y/config-*/)
+          # containing python.o, libpythonX.Y.a, Makefile, etc. Those exist only to
+          # *compile/link* C extensions against libpython; at runtime they are dead
+          # weight. Critically, the live-container / codesign pass walks every Mach-O
+          # in the bundle and aborts on the unsignable relocatable object python.o
+          #   (error: "Failed to Sign .../config-3.11-darwin/python.o").
+          # Blender's install_dir macro only drops config-*/*.a, not *.o, so prune here.
+          # No .a/.o static archive belongs in a runtime app bundle (link-time only),
+          # so removing them all is safe and also shrinks the .ipa substantially.
+          echo "Bundle size before prune: $(du -sh "$staged_app" | cut -f1)"
+          find "$staged_app" -depth -type d -name 'config-*'   -exec rm -rf {} +
+          find "$staged_app" -depth -type d -name '__pycache__' -exec rm -rf {} +
+          find "$staged_app" -type f \( -name '*.o' -o -name '*.a' -o -name '*.pyc' -o -name '*.pyo' \) -delete
+          # Belt-and-suspenders: fail loudly if any unsignable object file slipped through.
+          if leftover=$(find "$staged_app" -type f -name '*.o' -print -quit); [ -n "$leftover" ]; then
+            echo "::error::object file still present in bundle after prune: $leftover"; exit 1
+          fi
+          echo "Bundle size after prune:  $(du -sh "$staged_app" | cut -f1)"
+
+          # --- Normalize the staged Info.plist for a native iPad app ------------------
+          # IMPORTANT: this job checks out a PINNED source ref (see the `ref` input), whose
+          # Info.plist still declares UIMainStoryboardFile=Main, omits UIDeviceFamily, and
+          # predates the checked-in LaunchScreen.storyboard. That pinned source is NOT this
+          # branch's tree, so source-level fixes never reach the build — patch the *staged*
+          # bundle directly here. This is what actually ships, independent of the ref.
+          plist="$staged_app/Info.plist"
+          pb() { /usr/libexec/PlistBuddy -c "$1" "$plist"; }
+          # Blender builds its UI in code (GHOST_iosmain → custom IOSAppDelegate); there is
+          # no compiled Main.storyboardc, and referencing it throws at launch
+          # ("Could not find a storyboard named 'Main'").
+          pb "Delete :UIMainStoryboardFile" 2>/dev/null || true
+          # Native iPhone+iPad app (the intended TARGETED_DEVICE_FAMILY=1,2 is an Xcode
+          # attribute the Ninja build drops); without this iOS iPhone-compat-scales on iPad.
+          pb "Delete :LSRequiresIPhoneOS" 2>/dev/null || true
+          pb "Add :LSRequiresIPhoneOS bool true"
+          pb "Delete :UIDeviceFamily" 2>/dev/null || true
+          pb "Add :UIDeviceFamily array"
+          pb "Add :UIDeviceFamily:0 integer 1"
+          pb "Add :UIDeviceFamily:1 integer 2"
+          # Reference the launch storyboard compiled just below (native resolution).
+          pb "Delete :UILaunchStoryboardName" 2>/dev/null || true
+          pb "Add :UILaunchStoryboardName string LaunchScreen"
+          echo "Patched staged Info.plist (removed Main storyboard; UIDeviceFamily=1,2)"
+
+          # --- Launch screen (native iPad resolution) ---------------------------------
+          # UILaunchStoryboardName=LaunchScreen needs a *compiled* LaunchScreen.storyboardc
+          # in the bundle. The Ninja build never runs ibtool, and the pinned ref may lack
+          # the source, so prefer the checked-in file and otherwise synthesize a minimal
+          # dark launch screen here, then compile with ibtool.
+          sb_src="$GITHUB_WORKSPACE/release/ios/Blender.app/LaunchScreen.storyboard"
+          if [ ! -f "$sb_src" ]; then
+            sb_src="$RUNNER_TEMP/LaunchScreen.storyboard"
+            cat > "$sb_src" <<'STORYBOARD'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <document type="com.apple.InterfaceBuilder3.CocoaTouch.Storyboard.XIB" version="3.0" toolsVersion="22130" targetRuntime="iOS.CocoaTouch" propertyAccessControl="none" useAutolayout="YES" launchScreen="YES" useTraitCollections="YES" useSafeAreas="YES" colorMatched="YES" initialViewController="01J-lp-oVM">
+              <device id="ipad12_9rounded" orientation="landscape" layout="fullscreen" appearance="light"/>
+              <dependencies>
+                  <deployment identifier="iOS"/>
+                  <plugIn identifier="com.apple.InterfaceBuilder.IBCocoaTouchPlugin" version="22115"/>
+                  <capability name="Safe area layout guides" minToolsVersion="9.0"/>
+              </dependencies>
+              <scenes>
+                  <scene sceneID="EHf-IW-A2E">
+                      <objects>
+                          <viewController id="01J-lp-oVM" sceneMemberID="viewController">
+                              <view key="view" contentMode="scaleToFill" id="Ze5-6b-2t3">
+                                  <rect key="frame" x="0.0" y="0.0" width="1366" height="1024"/>
+                                  <autoresizingMask key="autoresizingMask" widthSizable="YES" heightSizable="YES"/>
+                                  <color key="backgroundColor" red="0.1137" green="0.1137" blue="0.1137" alpha="1" colorSpace="custom" customColorSpace="sRGB"/>
+                                  <viewLayoutGuide key="safeArea" id="6Tk-OE-BBY"/>
+                              </view>
+                          </viewController>
+                          <placeholder placeholderIdentifier="IBFirstResponder" id="iYj-Kq-Ea1" userLabel="First Responder" sceneMemberID="firstResponder"/>
+                      </objects>
+                  </scene>
+              </scenes>
+          </document>
+          STORYBOARD
+          fi
+          ibtool --errors --warnings --notices \
+            --target-device ipad --target-device iphone \
+            --minimum-deployment-target 13.0 \
+            --compile "$staged_app/LaunchScreen.storyboardc" "$sb_src" || true
+          if [ -e "$staged_app/LaunchScreen.storyboardc" ]; then
+            echo "Compiled LaunchScreen.storyboardc into bundle (native resolution enabled)"
+          else
+            echo "::warning::LaunchScreen.storyboardc missing; app may run letterboxed (not native iPad resolution)"
+          fi
+
+          # --- App icon (best effort; never blocks the .ipa) --------------------------
+          # The plist points CFBundleIconFile at a macOS .icns, which iOS ignores. Build a
+          # proper iOS icon set from that .icns with sips + actool and bake an Assets.car +
+          # CFBundleIcons into the bundle. Wrapped so any failure only drops the icon.
+          plist="$staged_app/Info.plist"
+          icns="$staged_app/Assets/blender_icon.icns"
+          (
+            set +e
+            command -v actool >/dev/null 2>&1 || { echo "::warning::actool unavailable; skipping app icon"; exit 0; }
+            [ -f "$icns" ] || { echo "::warning::$icns missing; skipping app icon"; exit 0; }
+            work="$RUNNER_TEMP/icon"; rm -rf "$work"; mkdir -p "$work"
+            master="$work/master.png"
+            sips -s format png --resampleHeightWidthMax 1024 "$icns" --out "$master" >/dev/null 2>&1 \
+              || { echo "::warning::could not rasterize $icns; skipping app icon"; exit 0; }
+            set_dir="$work/Assets.xcassets/AppIcon.appiconset"; mkdir -p "$set_dir"
+            gen() { sips -s format png -z "$2" "$2" "$master" --out "$set_dir/$1" >/dev/null 2>&1; }
+            gen icon-20.png 20;  gen icon-20@2x.png 40
+            gen icon-29.png 29;  gen icon-29@2x.png 58
+            gen icon-40.png 40;  gen icon-40@2x.png 80
+            gen icon-76.png 76;  gen icon-76@2x.png 152
+            gen icon-83.5@2x.png 167
+            gen icon-1024.png 1024
+            cat > "$set_dir/Contents.json" <<'JSON'
+          { "images": [
+            {"idiom":"ipad","size":"20x20","scale":"1x","filename":"icon-20.png"},
+            {"idiom":"ipad","size":"20x20","scale":"2x","filename":"icon-20@2x.png"},
+            {"idiom":"ipad","size":"29x29","scale":"1x","filename":"icon-29.png"},
+            {"idiom":"ipad","size":"29x29","scale":"2x","filename":"icon-29@2x.png"},
+            {"idiom":"ipad","size":"40x40","scale":"1x","filename":"icon-40.png"},
+            {"idiom":"ipad","size":"40x40","scale":"2x","filename":"icon-40@2x.png"},
+            {"idiom":"ipad","size":"76x76","scale":"1x","filename":"icon-76.png"},
+            {"idiom":"ipad","size":"76x76","scale":"2x","filename":"icon-76@2x.png"},
+            {"idiom":"ipad","size":"83.5x83.5","scale":"2x","filename":"icon-83.5@2x.png"},
+            {"idiom":"ios-marketing","size":"1024x1024","scale":"1x","filename":"icon-1024.png"}
+          ], "info": {"version":1,"author":"xcode"} }
+          JSON
+            partial="$work/partial.plist"
+            actool --compile "$staged_app" --app-icon AppIcon --platform iphoneos \
+              --minimum-deployment-target 13.0 --target-device ipad \
+              --output-partial-info-plist "$partial" "$work/Assets.xcassets" >/dev/null 2>&1
+            [ -f "$staged_app/Assets.car" ] || { echo "::warning::actool produced no Assets.car; shipping without a custom icon"; exit 0; }
+            # iOS ignores the macOS CFBundleIconFile; drop it and merge actool's icon keys.
+            /usr/libexec/PlistBuddy -c "Delete :CFBundleIconFile" "$plist" >/dev/null 2>&1
+            /usr/libexec/PlistBuddy -c "Merge '$partial'" "$plist" >/dev/null 2>&1
+            echo "App icon compiled into Assets.car and merged into Info.plist"
+          ) || echo "::warning::app icon step failed; shipping without a custom icon"
+
+          short_sha=$(git rev-parse --short HEAD)
+          name="Blender-iOS-unsigned-${short_sha}"
+          ipa="$GITHUB_WORKSPACE/${name}.ipa"
+          # -y preserves symlinks (dylibs/frameworks inside the bundle).
+          ( cd "$stage" && zip -qry "$ipa" Payload )
+          ls -lh "$ipa"
+          echo "name=$name" >> "$GITHUB_OUTPUT"
+          echo "ipa=$ipa" >> "$GITHUB_OUTPUT"
+
+      - name: Upload .ipa artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: ${{ steps.pkg.outputs.name }}
+          path: ${{ steps.pkg.outputs.ipa }}
+          if-no-files-found: error
+          retention-days: 14
